@@ -9,12 +9,23 @@ on:
         required: false
         default: "testing-ref1nd"
         type: string
+      release_tag:
+        description: "发布到哪个 Release tag（滚动覆盖）"
+        required: false
+        default: "ebpf-nightly"
+        type: string
+      publish:
+        description: "是否发布到 Releases"
+        required: false
+        default: true
+        type: boolean
   schedule:
     # 每天 18:00 UTC = 次日 02:00 (UTC+8)
     - cron: "0 18 * * *"
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 concurrency:
   group: ebpf-build-${{ github.ref }}
@@ -30,6 +41,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.outputs.outputs.version }}
+      sha: ${{ steps.outputs.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -48,7 +60,9 @@ jobs:
 
       - name: Set outputs
         id: outputs
-        run: echo "version=$version" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.tag }}-${{ matrix.variant }}
@@ -123,3 +137,66 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish to Releases
+    needs: [version, build]
+    # schedule 事件没有 inputs，默认发布；手动触发时由 publish 开关控制
+    if: ${{ github.event_name == 'schedule' || inputs.publish }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts of this run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          gh run download "${{ github.run_id }}" --repo "${{ github.repository }}" --dir raw
+          mkdir -p assets
+          find raw -type f -exec cp -v {} assets/ \;
+          ls -l assets
+          sha256sum assets/* > assets/SHA256SUMS.txt
+          cat assets/SHA256SUMS.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || 'ebpf-nightly' }}
+          VERSION: ${{ needs.version.outputs.version }}
+          REF_NAME: ${{ inputs.ref || 'testing-ref1nd' }}
+          SHA: ${{ needs.version.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TITLE="eBPF nightly — ${REF_NAME} (${VERSION})"
+          NOTES=$(cat <<EOF
+          由 \`.github/workflows/ebpf-build.yml\` 自动构建并发布（滚动更新，资产每次覆盖）。
+
+          | 项 | 值 |
+          |---|---|
+          | 上游分支 | \`${REF_NAME}\` |
+          | commit | [\`${SHA:0:12}\`](https://github.com/${REPO}/commit/${SHA}) |
+          | 版本 | \`${VERSION}\` |
+          | 构建标签 | \`DEFAULT_BUILD_TAGS_OTHERS\` + \`with_ebpf\`（musl 变体另加 \`with_musl\`） |
+          | 构建时间 | $(date -u '+%Y-%m-%d %H:%M UTC') |
+          | 工作流运行 | [#${{ github.run_number }}](https://github.com/${REPO}/actions/runs/${{ github.run_id }}) |
+
+          **产物**：linux amd64 / arm64 / armv7，glibc + musl 各一份（纯 Go 静态构建，CGO_ENABLED=0），
+          每份附 \`.sha256\`，汇总见 \`SHA256SUMS.txt\`。
+
+          > eBPF 入站仅 Linux / Android 构建包含；运行时需要 root 或 \`CAP_NET_ADMIN\`+\`CAP_BPF\`
+          > （老内核还需 \`CAP_SYS_ADMIN\`）。eBPF 不在任何默认构建标签中，本 Release 是唯一带 \`with_ebpf\` 的产物。
+
+          > 这是第三方 fork 的自动构建，与 SagerNet 官方发布无关；请自行核对 \`SHA256SUMS.txt\`。
+          EOF
+          )
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，更新标题/说明并覆盖资产"
+            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes "$NOTES" --prerelease
+          else
+            echo "创建 Release $TAG"
+            gh release create "$TAG" --repo "$REPO" --title "$TITLE" --notes "$NOTES" \
+              --prerelease --target "$SHA"
+          fi
+          gh release upload "$TAG" assets/* --repo "$REPO" --clobber
+          echo "### Release: $(gh release view "$TAG" --repo "$REPO" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --repo "$REPO" --json url,assets --jq '.url, (.assets[] | "  \(.name)  \(.size) bytes")'
