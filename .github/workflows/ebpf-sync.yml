@@ -1,0 +1,122 @@
+name: Sync upstream + build (eBPF)
+
+# 定时把 fork 的目标分支对齐上游 CHIZI-0618/sing-box，并在有更新时立即触发 eBPF 构建
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "要同步的分支（逗号分隔）"
+        required: false
+        default: "testing-ref1nd"
+        type: string
+      force_build:
+        description: "即使上游没有更新也触发一次构建"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "发布到哪个 Release tag"
+        required: false
+        default: "ebpf-nightly"
+        type: string
+  schedule:
+    # 每天 17:30 UTC = 次日 01:30 (UTC+8)，排在 18:00 UTC 的日常构建之前
+    - cron: "30 17 * * *"
+
+permissions:
+  contents: write # 更新 fork 的分支引用
+  actions: write # 触发 ebpf-build.yml
+
+concurrency:
+  group: ebpf-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: CHIZI-0618/sing-box
+  BUILD_WORKFLOW: ebpf-build.yml
+  # ebpf-build.yml 所在的 ref（必须是默认分支，schedule/workflow_dispatch 才能解析到它）
+  BUILD_REF: ebpf-inbound
+
+jobs:
+  sync:
+    name: Sync and dispatch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Sync branches from upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK: ${{ github.repository }}
+          BRANCHES: ${{ inputs.branches || 'testing-ref1nd' }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## 上游同步"
+            echo
+            echo "| 分支 | fork 旧 SHA | upstream 新 SHA | 结果 |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          changed_any=0
+          for b in ${BRANCHES//,/ }; do
+            up_sha=$(gh api "repos/${UPSTREAM}/git/ref/heads/${b}" --jq .object.sha)
+            fork_sha=$(gh api "repos/${FORK}/git/ref/heads/${b}" --jq .object.sha)
+
+            if [ "$up_sha" = "$fork_sha" ]; then
+              result="已是最新"
+              echo "::notice::${b} 已与上游一致（${up_sha}）"
+            else
+              echo "::notice::${b} 需要同步：${fork_sha} -> ${up_sha}"
+              # fork 网络与上游共享对象库，直接把 ref 指向上游 commit 即可
+              # （等价于网页 "Sync fork" 的 "Discard commits"）
+              if gh api -X PATCH "repos/${FORK}/git/refs/heads/${b}" \
+                   -f sha="$up_sha" -F force=true >/dev/null 2>&1; then
+                result="**已同步**"
+              else
+                echo "::warning::API 方式失败，回退到 git push"
+                rm -rf fork.git
+                git clone --bare --quiet \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git" fork.git
+                git -C fork.git fetch --quiet --no-tags \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git" \
+                  "+refs/heads/${b}:refs/heads/up-${b}"
+                git -C fork.git push --quiet --force \
+                  "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git" \
+                  "refs/heads/up-${b}:refs/heads/${b}"
+                result="**已同步**（git push）"
+              fi
+              changed_any=1
+              printf '%s\n' "- \`${b}\`: [${fork_sha:0:10} → ${up_sha:0:10}](https://github.com/${UPSTREAM}/compare/${fork_sha}...${up_sha})" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            printf '%s\n' "| \`${b}\` | \`${fork_sha:0:10}\` | \`${up_sha:0:10}\` | ${result} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          echo "changed_any=${changed_any}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORK: ${{ github.repository }}
+          BRANCHES: ${{ inputs.branches || 'testing-ref1nd' }}
+          RELEASE_TAG: ${{ inputs.release_tag || 'ebpf-nightly' }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+          CHANGED: ${{ steps.sync.outputs.changed_any }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGED" != "1" ] && [ "$FORCE_BUILD" != "true" ]; then
+            echo "上游无更新且未要求强制构建，跳过触发。" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for b in ${BRANCHES//,/ }; do
+            gh workflow run "$BUILD_WORKFLOW" \
+              --repo "$FORK" \
+              --ref "$BUILD_REF" \
+              -f ref="$b" \
+              -f release_tag="$RELEASE_TAG" \
+              -f publish=true
+            printf '%s\n' "- 已触发 \`${BUILD_WORKFLOW}\`（ref=\`${b}\`，release=\`${RELEASE_TAG}\`）" >> "$GITHUB_STEP_SUMMARY"
+          done
+          sleep 8
+          gh run list --repo "$FORK" --workflow "$BUILD_WORKFLOW" --limit 3
