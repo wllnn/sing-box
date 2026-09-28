@@ -109,11 +109,8 @@ jobs:
           if [ "${{ matrix.variant }}" = "musl" ]; then
             SUFFIX="-musl"
           fi
-          ARM=""
-          if [ -n "${GOARM:-}" ]; then
-            ARM="v${GOARM}"
-          fi
-          OUT="sing-box-${VERSION}-${{ matrix.tag }}${ARM}${SUFFIX}-ebpf"
+          # matrix.tag 已经包含架构（amd64/arm64/armv7），这里不再重复追加 GOARM
+          OUT="sing-box-${VERSION}-${{ matrix.tag }}${SUFFIX}-ebpf"
           mkdir -p dist
           go build -v -trimpath \
             -tags "${TAGS}" \
@@ -198,5 +195,12 @@ jobs:
               --prerelease --target "$SHA"
           fi
           gh release upload "$TAG" assets/* --repo "$REPO" --clobber
+          # 滚动 Release：清理本次构建不再产出的旧资产，避免重命名后残留
+          for name in $(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name'); do
+            if [ ! -f "assets/${name}" ]; then
+              echo "删除陈旧资产: ${name}"
+              gh release delete-asset "$TAG" "$name" --repo "$REPO" -y
+            fi
+          done
           echo "### Release: $(gh release view "$TAG" --repo "$REPO" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
           gh release view "$TAG" --repo "$REPO" --json url,assets --jq '.url, (.assets[] | "  \(.name)  \(.size) bytes")'
