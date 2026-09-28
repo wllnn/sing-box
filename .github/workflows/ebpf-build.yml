@@ -1,0 +1,125 @@
+name: Build eBPF (testing-ref1nd)
+
+# 手动触发（可选择任意 ref）或每天定时构建 testing-ref1nd + with_ebpf
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的 git ref"
+        required: false
+        default: "testing-ref1nd"
+        type: string
+  schedule:
+    # 每天 18:00 UTC = 次日 02:00 (UTC+8)
+    - cron: "0 18 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ebpf-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 与 release/DEFAULT_BUILD_TAGS_OTHERS 一致，再叠加 with_ebpf（eBPF 不在任何默认标签里）
+  BASE_TAGS: with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+
+jobs:
+  version:
+    name: Calculate version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.outputs.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || 'testing-ref1nd' }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Calculate version
+        run: go run -v ./cmd/internal/read_tag --ci --nightly
+
+      - name: Set outputs
+        id: outputs
+        run: echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.tag }}-${{ matrix.variant }}
+    needs: version
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: amd64, variant: glibc, tag: linux-amd64 }
+          - { goarch: amd64, variant: musl, tag: linux-amd64 }
+          - { goarch: arm64, variant: glibc, tag: linux-arm64 }
+          - { goarch: arm64, variant: musl, tag: linux-arm64 }
+          - { goarch: arm, variant: glibc, tag: linux-armv7, goarm: "7" }
+          - { goarch: arm, variant: musl, tag: linux-armv7, goarm: "7" }
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || 'testing-ref1nd' }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euxo pipefail
+          TAGS="${BASE_TAGS},with_ebpf"
+          if [ "${{ matrix.variant }}" = "musl" ]; then
+            TAGS="${TAGS},with_musl"
+          fi
+          SUFFIX=""
+          if [ "${{ matrix.variant }}" = "musl" ]; then
+            SUFFIX="-musl"
+          fi
+          ARM=""
+          if [ -n "${GOARM:-}" ]; then
+            ARM="v${GOARM}"
+          fi
+          OUT="sing-box-${VERSION}-${{ matrix.tag }}${ARM}${SUFFIX}-ebpf"
+          mkdir -p dist
+          go build -v -trimpath \
+            -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' $(cat release/LDFLAGS) -s -w -buildid=" \
+            -o "dist/${OUT}" ./cmd/sing-box
+          sha256sum "dist/${OUT}" | tee "dist/${OUT}.sha256"
+          {
+            echo "### ${OUT}"
+            echo '```'
+            echo "ref:    $(git rev-parse HEAD)"
+            echo "tags:   ${TAGS}"
+            ls -l "dist/${OUT}"
+            cat "dist/${OUT}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-${{ needs.version.outputs.version }}-${{ matrix.tag }}-${{ matrix.variant }}-ebpf
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
