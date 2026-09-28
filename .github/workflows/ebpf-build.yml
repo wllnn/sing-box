@@ -49,20 +49,24 @@ jobs:
           ref: ${{ inputs.ref || 'testing-ref1nd' }}
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
       - name: Calculate version
-        run: go run -v ./cmd/internal/read_tag --ci --nightly
-
-      - name: Set outputs
         id: outputs
         run: |
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # 不用 cmd/internal/read_tag：它执行的是不带 --match 的 `git describe --tags`，
+          # 会被本仓库的发布 tag（如 ebpf-nightly）污染成 0.0.0。
+          # 这里只认 v* 版本 tag，并复刻 build_shared.ReadTagVersion 的 nightly 规则：
+          # 不在 tag 上且该 tag 不是预发布版本时，patch + 1。
+          BASE_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo v0.0.0)
+          NEAREST=$(git describe --tags --match 'v[0-9]*' 2>/dev/null || echo "$BASE_TAG")
+          VERSION="${BASE_TAG#v}"
+          if [ "$NEAREST" != "$BASE_TAG" ] && [[ "$VERSION" != *-* ]]; then
+            VERSION=$(awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}' <<<"$VERSION")
+          fi
+          SHA=$(git rev-parse HEAD)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "base_tag=${BASE_TAG} nearest=${NEAREST} commit=${SHA} => version=${VERSION}"
 
   build:
     name: ${{ matrix.tag }}-${{ matrix.variant }}
