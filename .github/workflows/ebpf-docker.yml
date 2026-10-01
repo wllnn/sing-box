@@ -1,0 +1,281 @@
+name: Build eBPF Docker image
+
+# ============================================================================
+# 为 fork 的 testing-ref1nd 分支构建带 with_ebpf 的 Docker 镜像，推送到 GHCR。
+# 全部在 GitHub Actions 上完成，不需要本地编译。
+#
+# 跟随上游的完整链路：
+#   ebpf-sync.yml      定时把 testing-ref1nd 对齐上游 CHIZI-0618/sing-box（有更新才继续）
+#     └─ ebpf-build.yml  编译带 eBPF 的二进制并滚动发布 Release「ebpf-nightly」
+#          └─ 本 workflow 在它成功结束后自动跟随，构建并发布容器镜像
+#
+# 也可以随时手动触发：Actions → Build eBPF Docker image → Run workflow
+#
+# 为什么先交叉编译再 COPY 进镜像，而不是在容器里 go build：
+#   arm64 在 GitHub 上只能靠 QEMU 模拟，容器内编译要十几分钟；
+#   宿主机交叉编译（CGO_ENABLED=0，纯静态）再 COPY 进镜像只要一两分钟。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "源分支"
+        required: false
+        default: testing-ref1nd
+        type: string
+      platforms:
+        description: "目标架构，逗号分隔。要 32 位 ARM 可加 linux/arm/v7"
+        required: false
+        default: "linux/amd64,linux/arm64"
+        type: string
+      force:
+        description: "该 commit 已发布过也强制重建"
+        required: false
+        default: false
+        type: boolean
+      push:
+        description: "推送到 GHCR（关闭则只在 runner 上构建，用于排错）"
+        required: false
+        default: true
+        type: boolean
+
+  # 上游有更新 → ebpf-build 跑完 → 自动跟随
+  workflow_run:
+    workflows: ["Build eBPF (testing-ref1nd)"]
+    types: [completed]
+
+  # 兜底：每天 21:00 UTC = 次日 05:00 (UTC+8)，远晚于 ebpf-build 的 18:00 UTC。
+  # commit 没变时由 guard 步骤秒退，不会重复推送。
+  schedule:
+    - cron: "0 21 * * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ebpf-docker
+  cancel-in-progress: false
+
+env:
+  # 基础镜像。二进制是 CGO_ENABLED=0 的纯静态构建，跑在 alpine(musl) 上没问题。
+  BASE_IMAGE: alpine:3
+  # 与 release/DEFAULT_BUILD_TAGS_OTHERS 一致；with_ebpf 不在任何默认标签里，因此显式叠加。
+  BASE_TAGS: with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+
+jobs:
+  image:
+    name: Build and push
+    # 跟随 ebpf-build 时，只有它构建成功才继续
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      PUSH: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+      FORCE: ${{ inputs.force || false }}
+      PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+      SOURCE_REF: ${{ inputs.ref || 'testing-ref1nd' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || 'testing-ref1nd' }}
+          fetch-depth: 0
+
+      - name: Resolve version and image name
+        id: meta
+        run: |
+          set -euo pipefail
+
+          # 不用 cmd/internal/read_tag：它执行的是不带 --match 的 git describe --tags，
+          # 会被本仓库的发布 tag（ebpf-nightly）污染成 0.0.0。
+          # 这里只认 v* 版本 tag，并复刻 nightly 规则：不在 tag 上且非预发布则 patch + 1。
+          BASE_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo v0.0.0)
+          NEAREST=$(git describe --tags --match 'v[0-9]*' 2>/dev/null || echo "$BASE_TAG")
+          VERSION="${BASE_TAG#v}"
+          if [ "$NEAREST" != "$BASE_TAG" ] && [[ "$VERSION" != *-* ]]; then
+            VERSION=$(awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}' <<<"$VERSION")
+          fi
+
+          SHA=$(git rev-parse HEAD)
+          SHORT="${SHA:0:12}"
+          # GHCR 的镜像名必须全小写
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          {
+            echo "version=${VERSION}"
+            echo "sha=${SHA}"
+            echo "short=${SHORT}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version=${VERSION} sha=${SHA} image=${IMAGE}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ env.PUSH == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this commit is already published
+        id: guard
+        if: ${{ env.PUSH == 'true' && env.FORCE != 'true' }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::该 commit 的镜像已存在（sha-${{ steps.meta.outputs.short }}），跳过构建；要强制重建请手动触发并勾选 force。"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile eBPF binaries
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euxo pipefail
+          TAGS="${BASE_TAGS},with_ebpf"
+          echo "构建标签: ${TAGS}"
+
+          IFS=',' read -ra TARGETS <<< "${PLATFORMS}"
+          for platform in "${TARGETS[@]}"; do
+            platform="${platform//[[:space:]]/}"
+            [ -n "$platform" ] || continue
+
+            goos="${platform%%/*}"
+            rest="${platform#*/}"
+            goarch="${rest%%/*}"
+            variant=""
+            [ "$rest" != "$goarch" ] && variant="${rest##*/}"
+            [ "$goos" = "linux" ] || { echo "::error::只支持 linux 目标，收到 ${platform}"; exit 1; }
+
+            goarm=""
+            case "${goarch}/${variant}" in
+              arm/v7) goarm=7 ;;
+              arm/v6) goarm=6 ;;
+            esac
+
+            out="bin/${platform}/sing-box"
+            mkdir -p "$(dirname "$out")"
+
+            echo "::group::compile ${platform} (GOARCH=${goarch}${goarm:+ GOARM=${goarm}})"
+            if [ -n "$goarm" ]; then export GOARM="$goarm"; else unset GOARM; fi
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -v -trimpath \
+                -tags "${TAGS}" \
+                -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' $(cat release/LDFLAGS) -s -w -buildid=" \
+                -o "$out" ./cmd/sing-box
+            sha256sum "$out"
+            echo "::endgroup::"
+          done
+
+          find bin -type f -printf '%p  %s bytes\n'
+
+      - name: Write build context
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+
+          cat > Dockerfile <<'DOCKERFILE'
+          # syntax=docker/dockerfile:1
+          ARG BASE_IMAGE=alpine:3
+          FROM ${BASE_IMAGE}
+
+          # buildx 按目标平台自动注入，用来挑选对应的交叉编译产物
+          ARG TARGETPLATFORM
+
+          # nftables 供 TUN/auto_route 使用；ca-certificates 供 DoH/DoT 校验证书链
+          RUN apk add --no-cache bash tzdata ca-certificates nftables
+
+          COPY bin/${TARGETPLATFORM}/sing-box /usr/local/bin/sing-box
+          RUN mkdir -p /etc/sing-box
+
+          WORKDIR /etc/sing-box
+          ENTRYPOINT ["/usr/local/bin/sing-box"]
+          CMD ["run", "-c", "/etc/sing-box/config.json"]
+          DOCKERFILE
+
+          # 只把产物送进构建上下文，避免把整个源码树传给 BuildKit
+          cat > .dockerignore <<'DOCKERIGNORE'
+          *
+          !bin
+          !bin/**
+          !Dockerfile
+          DOCKERIGNORE
+
+          echo "--- Dockerfile ---"
+          cat Dockerfile
+          echo "--- .dockerignore ---"
+          cat .dockerignore
+
+      - name: Set up QEMU
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build and push image
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # 不推送时不能用多平台（本地 docker 导出器不支持 manifest list），退化成单架构
+          platforms: ${{ env.PUSH == 'true' && env.PLATFORMS || 'linux/amd64' }}
+          push: ${{ env.PUSH == 'true' }}
+          # 关闭 attestation，让 manifest 里只有目标架构那两个条目（要 SBOM/来源证明就改成 true）
+          provenance: false
+          sbom: false
+          # 不推送时把镜像载入 runner 的本地 docker，便于人工验证
+          load: ${{ env.PUSH != 'true' }}
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:testing-ref1nd-ebpf
+            ${{ steps.meta.outputs.image }}:testing-ref1nd-ebpf-${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.short }}
+          labels: |
+            org.opencontainers.image.title=sing-box ${{ steps.meta.outputs.version }} (testing-ref1nd + with_ebpf)
+            org.opencontainers.image.description=sing-box built from the testing-ref1nd branch with the with_ebpf build tag
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Summary
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "${PUSH}" = "true" ]; then
+            docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:testing-ref1nd-ebpf" || true
+          fi
+          {
+            echo "### Docker 镜像"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 源分支 | ${SOURCE_REF} |"
+            echo "| commit | ${{ steps.meta.outputs.sha }} |"
+            echo "| 版本 | ${{ steps.meta.outputs.version }} |"
+            echo "| 架构 | ${PLATFORMS} |"
+            echo "| 基础镜像 | ${BASE_IMAGE} |"
+            echo "| 构建标签 | ${BASE_TAGS},with_ebpf |"
+            echo "| 已推送 | ${PUSH} |"
+            echo
+            if [ "${PUSH}" = "true" ]; then
+              echo "拉取："
+              echo
+              echo "    docker pull ${{ steps.meta.outputs.image }}:testing-ref1nd-ebpf"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
